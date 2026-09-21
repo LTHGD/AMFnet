@@ -194,8 +194,8 @@ def train(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser("AdaptCLIP", add_help=True)
-    parser.add_argument("--train_data_path", type=str, default="./data/visa", help="train dataset path")
+    parser = argparse.ArgumentParser("AMFnet", add_help=True)
+    parser.add_argument("--train_data_path", type=str, default="./data/PCB", help="train dataset path")
     parser.add_argument("--save_path", type=str, default='./checkpoint', help='path to save results')
     parser.add_argument("--dataset", type=str, default='mvtec', help="train dataset name")
     parser.add_argument("--pretrained_model", type=str, default='ViT-L/14@336px', help="pre-trained model name")
