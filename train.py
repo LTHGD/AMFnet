@@ -197,7 +197,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser("AMFnet", add_help=True)
     parser.add_argument("--train_data_path", type=str, default="./data/PCB", help="train dataset path")
     parser.add_argument("--save_path", type=str, default='./checkpoint', help='path to save results')
-    parser.add_argument("--dataset", type=str, default='mvtec', help="train dataset name")
+    parser.add_argument("--dataset", type=str, default='PCB', help="train dataset name")
     parser.add_argument("--pretrained_model", type=str, default='ViT-L/14@336px', help="pre-trained model name")
     parser.add_argument("--n_ctx", type=int, default=12, help="the textual prompt length of textual learner")
     parser.add_argument("--features_list", type=int, nargs="+", default=[6, 12, 18, 24], help="features used")
