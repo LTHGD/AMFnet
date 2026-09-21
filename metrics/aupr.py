@@ -1,4 +1,4 @@
-"""Implementation of AUROC metric based on TorchMetrics."""
+
 
 # Copyright (C) 2022-2024 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
