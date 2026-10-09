@@ -1,3 +1,14 @@
+"""训练脚本（论文 Section III-B Implementation Details）。
+
+用法：
+  python train.py --config configs/default.yaml --seed 10
+  python train.py --config configs/default.yaml --trials 5   # 5 个 seed 依次训练
+  python train.py --synthetic --epochs 2 --image-size 128    # 冒烟验证
+
+训练配置对齐论文：AdamW(lr=1e-4) + cosine 退火 + 150 epochs + batch 8
++ 640x640 输入 + Focal(分类) + CIoU(回归, lambda=0.5)（Eq.20）。
+"""
+
 import argparse
 import csv
 import os
