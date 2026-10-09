@@ -1,0 +1,75 @@
+# =============================================================
+# AMFNet 默认配置
+# 论文: Information Compensation-based Adaptive Multi-scale
+#       Fusion Network for Chip Small Defect Detection
+# 对应论文 Section III-B "Implementation Details"
+# =============================================================
+
+experiment:
+  seed: 10                 # 单次试验种子
+  num_trials: 5            # 重复试验次数（论文采用 5 次独立重复）
+  seed_list: [10, 20, 30, 40, 50]
+  device: auto             # auto | cpu | cuda
+  output_dir: ./outputs
+
+data:
+  dataset: mems            # mems | pcb | synthetic
+  data_root: ./data/mems   # VOC 格式: data_root/JPEGImages + data_root/Annotations
+  ann_format: voc          # voc | coco（coco 时 data_root 指向 json 文件所在目录）
+  coco_json: annotations/instances.json
+  image_size: 640          # 输入分辨率（论文统一 640x640）
+  batch_size: 8
+  num_workers: 4
+  split_ratio: [0.8, 0.1, 0.1]   # 训练/验证/测试 = 8:1:1（分层随机）
+  use_augmentation: true   # 随机水平翻转/垂直翻转/亮度对比度（仅训练集）
+  # 类别列表（论文 Table II / Fig.6-7）
+  mems_classes: [aluminum_wire_bonding_broken, chip_injury, chip_scratch,
+                 glue_surface_wrinkle, gold_wire_bonding_broken]
+  pcb_classes: [Missing_hole, Mouse_bite, Open_circuit, Short, Spur,
+                Spurious_copper]
+
+model:
+  in_channels: 3
+  low_channels: 64         # C_l (Eq.1)
+  mid_channels: 128        # C_m (Eq.1)
+  high_channels: 256       # C_h (Eq.1)
+  tfic_channels: 256       # TFIC/MFBF 统一通道数
+  num_classes: 5           # mems:5, pcb:6
+
+  gatfe:                   # Eq.2 - Eq.8
+    low_patch: 4           # 低层图节点池化核（论文 N_L=H/2*W/2，即 patch=2；
+                           # 640 输入下 patch=2 节点数过多，默认 4 以平衡显存）
+    mid_patch: 2           # 中层节点池化核（N_M=H/4*W/4）
+    knn_window: 3          # 空间 K-NN 邻居窗口（3x3）
+    tau_L: 1.0             # 灰度核带宽 tau_L
+    tau_M: 1.0             # 灰度核带宽 tau_M
+    tau_H: 1.0             # 灰度核带宽 tau_H
+    hidden: 128            # MLP 隐层维度
+
+  tfic:                    # Eq.9 - Eq.12
+    attn_heads: 8
+    attn_window: 32        # 局部窗口注意力窗口大小（0 = 全局注意力）
+    dropout: 0.1
+    dual_branch: true      # 双分支注意力：边界截断 / 内部低对比度缺陷分别补偿
+
+  mfbf:                    # Eq.13 - Eq.16
+    hidden: 64
+
+  head:
+    type: centernet        # 检测头类型（CenterNet 风格：热图分类 + 中心偏移 + 尺寸回归）
+    hm_hidden: 128
+
+train:
+  epochs: 150              # 论文: 150 epochs
+  lr: 0.0001               # AdamW 初始学习率 1e-4
+  weight_decay: 0.0001
+  lambda_reg: 0.5          # Eq.20: L_total = L_cls + lambda * L_reg
+  focal_alpha: 2.0         # 分类 Focal loss 参数
+  focal_beta: 4.0
+  iou_thresh: 0.5          # 评测 IoU 阈值
+  log_interval: 20
+  save_interval: 10
+
+eval:
+  conf_thresh: 0.1         # 推理置信度阈值
+  topk: 200                # 每图最多保留检测数
