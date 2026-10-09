@@ -11,7 +11,7 @@ for Chip Small Defect Detection》（IEEE TSM）
 pip install -r requirements.txt
 
 # 1) 冒烟测试（无需真实数据，验证前向/反向可跑通）
-python scripts/smoke_test.py
+python scripts/test.py
 
 # 2) 合成数据快速训练（验证全流程）
 python train.py --synthetic --epochs 2 --image-size 128 --batch-size 2
