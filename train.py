@@ -1,221 +1,194 @@
-"""Training script for AdaptCLIP anomaly detection model."""
-
 import argparse
+import csv
 import os
-import random
+import time
 
-import numpy as np
 import torch
 import torch.nn.functional as F
-from einops import rearrange
-from tqdm import tqdm
 
-import adaptcliplib
-from adaptcliplib import (BinaryDiceLoss, FocalLoss, PQAdapter, TextualAdapter,
-                          VisualAdapter)
-from dataset import Dataset, PromptDataset
-from tools import get_logger, get_transform, normalize, setup_seed
+from amfnet.model import AMFNet
+from amfnet.losses import AMFLoss
+from amfnet.head import build_targets, decode_predictions
+from amfnet.metrics import DetectionMetrics
+from amfnet.utils import (Cfg, load_config, set_seed, resolve_device,
+                          save_checkpoint)
+from amfnet.data import (SyntheticDefectDataset, build_loaders,
+                         DATASET_CLASSES)
 
 
-def train(args):
-    img_size = args.image_size
-    features_list = args.features_list
-    save_path = args.save_path
-    dataset_name = args.dataset
-    batch_size = args.batch_size
-    k_shots = args.k_shots
-    seed = args.seed
-    vl_reduction = args.vl_reduction
-    pq_mid_dim = args.pq_mid_dim
-    pq_context = args.pq_context
+def parse_args():
+    p = argparse.ArgumentParser(description="AMFNet 训练")
+    p.add_argument("--config", default="configs/default.yaml")
+    p.add_argument("--seed", type=int, default=None, help="覆盖配置中的 seed")
+    p.add_argument("--trials", action="store_true", help="按 seed_list 依次训练 5 次")
+    p.add_argument("--epochs", type=int, default=None, help="覆盖训练 epoch 数")
+    p.add_argument("--image-size", type=int, default=None, help="覆盖输入分辨率")
+    p.add_argument("--batch-size", type=int, default=None, help="覆盖 batch size")
+    p.add_argument("--synthetic", action="store_true", help="使用合成数据（冒烟测试）")
+    p.add_argument("--num-classes", type=int, default=5, help="合成数据类别数")
+    p.add_argument("--out", default=None, help="覆盖输出目录")
+    return p.parse_args()
 
-    mode = 'train'
 
-    log_file = f'{dataset_name}_{seed}seed_{k_shots}shot_{mode}_log.txt'
-    logger = get_logger(args.save_path, log_file)
+def build_model_and_loaders(cfg, args, seed, device):
+    if args.synthetic:
+        from torch.utils.data import DataLoader
+        n = 200
+        cfg.model.num_classes = args.num_classes
+        cfg.data.image_size = args.image_size or cfg.data.image_size
+        tr = SyntheticDefectDataset(num_samples=n, image_size=int(cfg.data.image_size),
+                                    num_classes=args.num_classes, seed=seed)
+        va = SyntheticDefectDataset(num_samples=max(n // 10, 10),
+                                    image_size=int(cfg.data.image_size),
+                                    num_classes=args.num_classes, seed=seed + 1)
 
-    logger.info('\n')
-    logger.info(args)
+        def collate(batch):
+            imgs = torch.stack([b[0] for b in batch])
+            max_n = max(len(b[1]["boxes"]) for b in batch)
+            boxes = torch.zeros(len(batch), max_n, 4)
+            labels = torch.full((len(batch), max_n), -1, dtype=torch.long)
+            for i, (_, t) in enumerate(batch):
+                m = len(t["boxes"])
+                boxes[i, :m] = t["boxes"]
+                labels[i, :m] = t["labels"]
+            return imgs, {"boxes": boxes, "labels": labels}
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    # ====================== Model Initialization  ======================
+        bs = args.batch_size or int(cfg.data.batch_size)
+        train_loader = DataLoader(tr, batch_size=bs, shuffle=True, collate_fn=collate)
+        val_loader = DataLoader(va, batch_size=bs, shuffle=False, collate_fn=collate)
+        test_loader = val_loader
+    else:
+        if args.image_size:
+            cfg.data.image_size = args.image_size
+        if args.batch_size:
+            cfg.data.batch_size = args.batch_size
+        train_loader, val_loader, test_loader = build_loaders(cfg, seed=seed)
+    model = AMFNet(cfg).to(device)
+    return model, train_loader, val_loader, test_loader
 
-    if args.pretrained_model == 'ViT-L/14@336px':
-        model, _ = adaptcliplib.load(args.pretrained_model, device=device)
-        DPAM_layer = 20
-        patch_size = 14
-        input_dim = 768
-        model.visual.DAPM_replace(DPAM_layer = DPAM_layer)
-    if args.pretrained_model == 'VITB16_PLUS_240':
-        model, _ = adaptcliplib.load(args.pretrained_model, device=device)
-        DPAM_layer = 10
-        patch_size = 16
-        input_dim = 640
-        model.visual.DAPM_replace(DPAM_layer = DPAM_layer)
 
-    if args.pretrained_model == 'ViT-L-14-CLIPA-336':
-        model, _ = adaptcliplib.load(args.pretrained_model, device=device)
-        DPAM_layer = 20
-        patch_size = 14
-        input_dim = 768
-        model.visual.DAPM_replace(DPAM_layer = DPAM_layer)
-
-    # ====================== Init Adapters ======================
-    textual_learner = TextualAdapter(model.to("cpu"), img_size, args.n_ctx)
-    visual_learner = VisualAdapter(img_size, patch_size, input_dim=input_dim, reduction=vl_reduction)
-    pq_learner = PQAdapter(img_size, patch_size, context=pq_context, input_dim=input_dim, mid_dim=pq_mid_dim, layers_num=len(features_list))
-
-    model.to(device)
-    textual_learner.to(device)
-    visual_learner.to(device)
-    pq_learner.to(device)
-
+def evaluate(model, loader, device, cfg, image_size):
+    """验证集评测：解码 + IoU 匹配 -> Precision / Recall / mAP。"""
     model.eval()
-    textual_learner.train()
-    visual_learner.train()
-    pq_learner.train()
-
-    textual_learner_parameters = sum(p.numel() for p in textual_learner.parameters())
-    visual_learner_parameters = sum(p.numel() for p in visual_learner.parameters())
-    pq_learner_parameters = sum(p.numel() for p in pq_learner.parameters())
-
-    learned_parameters = textual_learner_parameters + visual_learner_parameters + pq_learner_parameters
-    fixed_parameters = sum(p.numel() for p in model.parameters())
-
-
-    print(f"textual_learner params:{(textual_learner_parameters):.0f}",
-          f"visual_learner params:{(visual_learner_parameters)/1e+6:.1f}M",
-          f"pq_learner params:{(pq_learner_parameters)/1e+6:.1f}M",
-          f"learned all parameters:{(learned_parameters)/1e+6:.1f}M",
-          f"fixed params:{(fixed_parameters)/1e+6:.1f}M",
-          f"all params:{(learned_parameters+fixed_parameters)/1e+6:.1f}M"
-     )
-
-    # ====================== Optimizer and Loss  ======================
-    optimizer = torch.optim.Adam(
-        list(textual_learner.parameters()) + list(visual_learner.parameters()) + list(pq_learner.parameters()),
-        lr=args.learning_rate,
-        betas=(0.5, 0.999)
-        )
-
-    loss_focal = FocalLoss()
-    loss_dice = BinaryDiceLoss()
+    metrics = DetectionMetrics(int(cfg.model.num_classes),
+                               iou_thresh=float(cfg.train.iou_thresh))
+    out_stride = 2
+    with torch.no_grad():
+        for imgs, targets in loader:
+            imgs = imgs.to(device)
+            pred = model(imgs)
+            conf = float(cfg.eval.conf_thresh)
+            topk = int(cfg.eval.topk)
+            for i in range(imgs.shape[0]):
+                p = {k: v[i:i + 1] for k, v in pred.items()}
+                boxes, scores, labels = decode_predictions(
+                    p, conf_thresh=conf, topk=topk, stride=out_stride,
+                    image_size=image_size, nms_thresh=float(cfg.train.iou_thresh))
+                gt_n = (targets["labels"][i] >= 0).sum().item()
+                metrics.update(
+                    boxes.cpu().numpy(), scores.cpu().numpy(),
+                    labels.cpu().numpy(),
+                    targets["boxes"][i, :gt_n].numpy(),
+                    targets["labels"][i, :gt_n].numpy())
+    return metrics.summarize()
 
 
-    # ====================== Data  ======================
-    preprocess, target_transform = get_transform(image_size=args.image_size)
-    train_data = Dataset(root=args.train_data_path, transform=preprocess, target_transform=target_transform, \
-                         dataset_name = dataset_name, k_shots= k_shots, save_dir=save_path, mode='train', seed=seed)
-    train_data_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=4)
-    obj_list = train_data.obj_list
+def run_trial(cfg, args, seed, device):
+    """单个 seed 的完整训练 + 验证。返回 (val_metrics, best_ckpt_path)。"""
+    set_seed(seed)
+    model, train_loader, val_loader, test_loader = build_model_and_loaders(
+        cfg, args, seed, device)
+    image_size = int(cfg.data.image_size)
 
+    optimizer = torch.optim.AdamW(model.parameters(),
+                                  lr=float(cfg.train.lr),
+                                  weight_decay=float(cfg.train.weight_decay))
+    epochs = args.epochs or int(cfg.train.epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    criterion = AMFLoss(focal_alpha=float(cfg.train.focal_alpha),
+                        focal_beta=float(cfg.train.focal_beta),
+                        lambda_reg=float(cfg.train.lambda_reg))
 
-    # ====================== forward and backward ======================
-    textual_learner.prepare_static_text_feature(model)
-    for epoch in tqdm(range(args.epoch)):
-        local_loss_list = []
-        global_loss_list = []
+    out_dir = args.out or os.path.join(cfg.experiment.output_dir, f"seed{seed}")
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, "train_log.csv")
+    logf = open(csv_path, "w", newline="")
+    writer = csv.writer(logf)
+    writer.writerow(["epoch", "lr", "loss_cls", "loss_reg", "loss_total",
+                     "val_mAP", "val_precision", "val_recall"])
 
-        for items in tqdm(train_data_loader):
-            prompt_image = items['prompt_img'].to(device)  # B*s*c*h*w
-            b, s, c, h, w = prompt_image.shape
-            prompt_image = prompt_image.reshape(-1, c, h, w)
+    best_map, best_ckpt = -1.0, None
+    for epoch in range(1, epochs + 1):
+        model.train()
+        t0 = time.time()
+        tot_cls = tot_reg = tot_n = 0
+        for step, (imgs, targets) in enumerate(train_loader):
+            imgs = imgs.to(device)
+            # 构造热图目标
+            out_h, out_w = imgs.shape[2] // 2, imgs.shape[3] // 2
+            hm = torch.zeros(imgs.shape[0], int(cfg.model.num_classes),
+                             out_h, out_w, device=device)
+            off = torch.zeros(imgs.shape[0], 2, out_h, out_w, device=device)
+            sz = torch.zeros(imgs.shape[0], 2, out_h, out_w, device=device)
+            for i in range(imgs.shape[0]):
+                gt_n = (targets["labels"][i] >= 0).sum().item()
+                if gt_n == 0:
+                    continue
+                t = build_targets(targets["boxes"][i, :gt_n],
+                                  targets["labels"][i, :gt_n],
+                                  out_h, out_w, int(cfg.model.num_classes), stride=2)
+                hm[i] = t["heatmap"][0]
+                off[i] = t["offset"][0]
+                sz[i] = t["size"][0]
+            target = {"heatmap": hm, "offset": off, "size": sz}
 
-            image = items['img'].to(device)
-            label =  items['anomaly']
-
-            gt = items['img_mask'].squeeze().to(device)
-            gt[gt > 0.5] = 1
-            gt[gt <= 0.5] = 0
-
-            with torch.no_grad():
-                query_feats, query_patch_feats = model.encode_image(image, args.features_list, DPAM_layer = DPAM_layer)
-                prompt_feats, prompt_patch_feats = model.encode_image(prompt_image, args.features_list, DPAM_layer = DPAM_layer)
-
-                prompt_feats = prompt_feats.reshape(b, s, -1)
-                for idx in range(len(args.features_list)):
-                    prompt_patch_feats[idx] = rearrange(prompt_patch_feats[idx], '(b s) l d -> b s l d', b=b, s=s)
-
-            local_loss = 0
-            global_loss = 0
-            # ====================== visual_adapter ======================
-            if args.visual_learner:
-                static_text_features = textual_learner.static_text_features
-                global_logit, local_score = visual_learner(query_feats, query_patch_feats, static_text_features)
-
-                global_loss += F.cross_entropy(global_logit, label.long().cuda())
-
-                local_loss += loss_focal(local_score, gt)
-                local_loss += loss_dice(local_score[:, 1, :, :], gt)
-                local_loss += loss_dice(local_score[:, 0, :, :], 1-gt)
-
-            # ====================== textual_adapter ======================
-            if args.textual_learner:
-                learned_prompts, tokenized_prompts = textual_learner()
-                learned_text_features = model.encode_text(learned_prompts, tokenized_prompts).float()  # [2, 768]
-                global_logit, local_score = textual_learner.compute_global_local_score(query_feats, query_patch_feats, learned_text_features)
-
-                global_loss += F.cross_entropy(global_logit, label.long().cuda())
-
-                local_loss += loss_focal(local_score, gt)
-                local_loss += loss_dice(local_score[:, 1, :, :], gt)
-                local_loss += loss_dice(local_score[:, 0, :, :], 1-gt)
-
-            # ====================== pq_adapter ======================
-            if args.pq_learner:
-                global_logit, local_score_list, align_score_list = pq_learner(query_feats, query_patch_feats, prompt_feats, prompt_patch_feats)
-
-                for i in range(len(global_logit)):
-                    global_loss += F.cross_entropy(global_logit[i], label.long().cuda())
-
-                for i in range(len(local_score_list)):
-                    local_loss += loss_focal(local_score_list[i], gt)
-                    local_loss += loss_dice(local_score_list[i][:, 1, :, :], gt)
-                    local_loss += loss_dice(local_score_list[i][:, 0, :, :], 1-gt)
-
-
+            pred = model(imgs)
+            cls_loss, total_loss = criterion(pred, target)
             optimizer.zero_grad()
-            (local_loss + global_loss).backward()
+            total_loss.backward()
             optimizer.step()
-            global_loss_list.append(global_loss.item())
-            local_loss_list.append(local_loss.item())
+            tot_cls += cls_loss.item()
+            tot_reg += (total_loss.item() - cls_loss.item())
+            tot_n += 1
+            if (step + 1) % int(cfg.train.log_interval) == 0:
+                print(f"  [seed{seed} ep{epoch} step{step+1}] "
+                      f"cls={cls_loss.item():.4f} total={total_loss.item():.4f}")
+        scheduler.step()
+        lr = optimizer.param_groups[0]["lr"]
 
-        # logs
-        if (epoch + 1) % args.print_freq == 0:
-            logger.info('epoch [{}/{}], global_loss:{:.4f}, local_loss:{:.4f}'.format(epoch + 1, args.epoch, np.mean(global_loss_list), np.mean(local_loss_list)))
+        val = evaluate(model, val_loader, device, cfg, image_size)
+        writer.writerow([epoch, f"{lr:.2e}", f"{tot_cls/max(tot_n,1):.4f}",
+                         f"{tot_reg/max(tot_n,1):.4f}",
+                         f"{(tot_cls+tot_reg)/max(tot_n,1):.4f}",
+                         f"{val['mAP']:.4f}", f"{val['precision']:.4f}",
+                         f"{val['recall']:.4f}"])
+        logf.flush()
+        print(f"[seed{seed} ep{epoch}] lr={lr:.2e} "
+              f"loss_cls={tot_cls/max(tot_n,1):.4f} "
+              f"val_mAP={val['mAP']:.4f} val_P={val['precision']:.4f} "
+              f"val_R={val['recall']:.4f} ({time.time()-t0:.1f}s)")
 
-        # save model
-        if (epoch + 1) % args.save_freq == 0:
-            ckp_path = os.path.join(args.save_path, 'epoch_' + str(epoch + 1) + '.pth')
-            torch.save({"textual_learner": textual_learner.state_dict(),
-                        "visual_learner": visual_learner.state_dict(),
-                        "pq_learner": pq_learner.state_dict(),
-                        }, ckp_path)
+        if val["mAP"] > best_map:
+            best_map = val["mAP"]
+            best_ckpt = os.path.join(out_dir, "best.pt")
+            save_checkpoint(model, optimizer, scheduler, epoch, cfg, best_ckpt)
+        if epoch % int(cfg.train.save_interval) == 0:
+            save_checkpoint(model, optimizer, scheduler, epoch, cfg,
+                            os.path.join(out_dir, f"epoch{epoch}.pt"))
+    logf.close()
+    return {"seed": seed, "val_mAP": best_map, "best_ckpt": best_ckpt}
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser("AMFnet", add_help=True)
-    parser.add_argument("--train_data_path", type=str, default="./data/PCB", help="train dataset path")
-    parser.add_argument("--save_path", type=str, default='./checkpoint', help='path to save results')
-    parser.add_argument("--dataset", type=str, default='PCB', help="train dataset name")
-    parser.add_argument("--pretrained_model", type=str, default='ViT-L/14@336px', help="pre-trained model name")
-    parser.add_argument("--n_ctx", type=int, default=12, help="the textual prompt length of textual learner")
-    parser.add_argument("--features_list", type=int, nargs="+", default=[6, 12, 18, 24], help="features used")
-    parser.add_argument("--epoch", type=int, default=15, help="epochs")
-    parser.add_argument("--learning_rate", type=float, default=0.001, help="learning rate")
-    parser.add_argument("--batch_size", type=int, default=8, help="batch size")
-    parser.add_argument("--image_size", type=int, default=518, help="image size")
-    parser.add_argument("--print_freq", type=int, default=1, help="print frequency")
-    parser.add_argument("--save_freq", type=int, default=1, help="save frequency")
-    parser.add_argument("--seed", type=int, default=10, help="random seed")
-    parser.add_argument("--k_shots", type=int, default=1, help="how many normal samples")
-    parser.add_argument("--visual_learner", action="store_true", help="Enable visual adapter")
-    parser.add_argument("--textual_learner", action="store_true", help="Enable textual adapter")
-    parser.add_argument("--pq_learner", action="store_true", help="Enable prompt-query adapter")
-    parser.add_argument("--vl_reduction", type=int, default=4, help="the reduction number of visual learner")
-    parser.add_argument("--pq_mid_dim", type=int, default=128, help="the number of the first hidden layer in pqadapter")
-    parser.add_argument("--pq_context", action="store_true", help="Enable context feature")
+def main():
+    args = parse_args()
+    cfg = load_config(args.config)
+    device = resolve_device(cfg.experiment.device)
+    print(f"设备: {device}")
+    seeds = cfg.experiment.seed_list if args.trials else [args.seed or cfg.experiment.seed]
+    for seed in seeds:
+        print(f"===== 训练试验 seed={seed} =====")
+        run_trial(cfg, args, int(seed), device)
 
-    args = parser.parse_args()
-    setup_seed(args.seed)
-    train(args)
+
+if __name__ == "__main__":
+    main()
