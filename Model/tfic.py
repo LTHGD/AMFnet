@@ -1,21 +1,4 @@
-"""TFIC：Transformer 特征信息补偿模块（论文 Eq.9 - Eq.12）。
 
-目标：利用浅层细节与深层语义双向补偿中层特征，恢复不完整缺陷
-（边界截断缺陷 / 低对比度内部缺陷）在下采样中丢失的细节信息。
-
-核心组件：
-  - GCB  全局上下文块（Eq.9）：源自 GCNet，含三点针对性改进
-       ① 引入 GAT-FE 传来的缺陷置信度权重，动态放大缺陷区域响应；
-       ② 双分支注意力分别补偿"边界截断"与"内部低对比度"两类缺陷；
-       ③ 内嵌卷积上/下采样分支实现多尺度信息匹配。
-  - CDB  卷积下采样块（Eq.11）：f_CDB = sigma(BN(Conv_3x3(.)))
-
-双向补偿结构（Eq.12），三个分支输出均对齐到中间尺度 H/2 x W/2：
-    F_TIC^L = Down(GCB(F_L))                      浅层细节 -> 中间尺度
-    F_TIC^M = CDB(GCB(F_M)) + F_M                 中层自增强（保持尺度）
-    F_TIC^H = Up(GCB(CDB(F_H))) + Up(F_H)         深层语义 -> 中间尺度
-    F_TIC   = F_TIC^L + F_TIC^M + F_TIC^H
-"""
 
 import torch
 import torch.nn as nn
