@@ -1,7 +1,7 @@
 # AMFNet 官方实现（Python / PyTorch）
 
 论文：《Information Compensation-based Adaptive Multi-scale Fusion Network
-for Chip Small Defect Detection》（IEEE TSM）
+for Chip Small Defect Detection》
 对应论文 Fig.1：`Backbone(Eq.1) → GAT-FE(Eq.2-8) → TFIC(Eq.9-12) → MFBF(Eq.13-16) → Detection Head`
 
 
