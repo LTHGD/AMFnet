@@ -28,7 +28,7 @@ python inference.py --ckpt outputs/seed10/best.pt --image test.png --out result.
 
 ## 数据准备
 
-- **Automotive MEMS 压力传感器**（5 类，5874 张，Table II）：
+-MEMS （5 类，5874 张，Table II）：
   `data/mems/JPEGImages/*.jpg` + `data/mems/Annotations/*.xml`（VOC 格式）
 - **PCB**（6 类，693 张）：`data/pcb/JPEGImages/*.jpg` + `data/pcb/Annotations/*.xml`
 
